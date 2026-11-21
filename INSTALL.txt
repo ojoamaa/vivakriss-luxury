@@ -1,0 +1,7 @@
+Vivakriss reports update. BACK UP index.html, backend/main.py, and vivakriss_dev.db before replacing.
+Replace only index.html and backend/main.py. Keep assets and existing DB.
+Admin login: http://127.0.0.1:8000/#manage (bookmark privately). Public navigation no longer shows Manage Products.
+IMPORTANT: Hiding a link is not security; backend report and write endpoints require a valid admin Bearer token.
+New stock_movements table is created automatically. Historical stock adjustments are not reconstructable and are not backfilled.
+CSV exports: orders, inventory, stock movements. Verified receipts are NOT profit.
+Do not deploy without proper production configuration, database backups, persistent storage, CORS and security review.

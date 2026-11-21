@@ -1,0 +1,33 @@
+# Python environment and cache
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local environment and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Local databases and backups
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.bak
+*.backup
+
+# Customer receipts and uploaded files
+backend/uploads/
+backend/receipts/
+uploads/
+receipts/
+
+# Local development files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
