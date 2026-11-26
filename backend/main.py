@@ -1,11 +1,11 @@
 """Vivakriss Luxury production backend starter. No automatic bank verification."""
 import os, secrets, uuid, hashlib, csv, io
 from datetime import datetime, timezone, timedelta
-from decimal import Decimal
+from decimal import Decimal, ROUND_UP
 from pathlib import Path
 from typing import Optional
 from sqlalchemy import Boolean, update
-from fastapi import FastAPI, Depends, HTTPException, Header, UploadFile, File
+from fastapi import FastAPI, Depends, HTTPException, Header, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
@@ -77,6 +77,20 @@ class Admin(Base):
     id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
     username:Mapped[str]=mapped_column(String(100),unique=True)
     password_hash:Mapped[str]=mapped_column(String(255))
+class BespokeRequest(Base):
+    __tablename__='bespoke_requests'
+    id:Mapped[str]=mapped_column(String(36),primary_key=True)
+    access_hash:Mapped[str]=mapped_column(String(64))
+    customer_name:Mapped[str]=mapped_column(String(120))
+    phone:Mapped[str]=mapped_column(String(30))
+    email:Mapped[str]=mapped_column(String(200))
+    address:Mapped[str]=mapped_column(String(500))
+    description:Mapped[str]=mapped_column(String(2000))
+    quote:Mapped[Optional[Decimal]]=mapped_column(Numeric(12,2),nullable=True)
+    order_id:Mapped[Optional[str]]=mapped_column(ForeignKey('orders.id'),nullable=True)
+    photo:Mapped[Optional[bytes]]=mapped_column(LargeBinary,nullable=True)
+    mime:Mapped[Optional[str]]=mapped_column(String(40),nullable=True)
+
 Base.metadata.create_all(engine)
 app=FastAPI(title='Vivakriss Luxury Orders API',docs_url=None if os.getenv('ENVIRONMENT')=='production' else '/docs')
 origins=[x.strip() for x in os.getenv('ALLOWED_ORIGINS','http://localhost:8000,http://127.0.0.1:8000').split(',') if x.strip()]
@@ -126,8 +140,10 @@ class Decision(BaseModel):
 class StatusIn(BaseModel):
     status:str
 
+def deposit_due(total): return (total*Decimal('.70')).quantize(Decimal('.01'),rounding=ROUND_UP)
+
 def order_view(o):
-    return {'id':o.id,'customer_name':o.customer_name,'phone':o.phone,'email':o.email,'address':o.address,'kind':o.kind,'description':o.description,'total':str(o.total),'verified_paid':str(o.verified_paid),'due_now':str(max(Decimal('0'),(o.total*Decimal('.70') if o.kind=='bespoke' else o.total)-o.verified_paid)),'balance':str(max(Decimal('0'),o.total-o.verified_paid)),'status':o.status}
+    return {'id':o.id,'customer_name':o.customer_name,'phone':o.phone,'email':o.email,'address':o.address,'kind':o.kind,'description':o.description,'total':str(o.total),'verified_paid':str(o.verified_paid),'due_now':str(max(Decimal('0'),(deposit_due(o.total) if o.kind=='bespoke' else o.total)-o.verified_paid)),'balance':str(max(Decimal('0'),o.total-o.verified_paid)),'status':o.status}
 
 @app.get('/health')
 def health(): return {'status':'ok'}
@@ -184,7 +200,9 @@ async def submit_receipt(order_id:str,amount:str,transfer_reference:str,file:Upl
     signatures={'image/jpeg':raw.startswith(b'\xff\xd8\xff'),'image/png':raw.startswith(b'\x89PNG\r\n\x1a\n'),'application/pdf':raw.startswith(b'%PDF-')}
     if not signatures[file.content_type]: raise HTTPException(415,'Invalid receipt format')
     p=Payment(id=str(uuid.uuid4()),order_id=o.id,amount=value,transfer_reference=transfer_reference,receipt_bytes=raw,receipt_type=file.content_type)
-    session.add(p);o.status='pending_verification';session.commit()
+    session.add(p)
+    if o.status in ('awaiting_payment','pending_verification'): o.status='pending_verification'
+    session.commit()
     return {'payment_id':p.id,'status':'pending_verification','message':'Receipt received. Payment not yet verified.'}
 @app.get('/admin/orders')
 def list_orders(who:str=Depends(admin_guard),session:Session=Depends(db)):
@@ -219,8 +237,9 @@ def review_payment(payment_id:str,decision:Decision,who:str=Depends(admin_guard)
     p.status='verified' if decision.approve else 'rejected';p.reviewed_at=datetime.now(timezone.utc)
     if decision.approve:
         o.verified_paid+=p.amount
-        if o.verified_paid>=o.total: o.status='fully_paid'
-        elif o.kind=='bespoke' and o.verified_paid>=o.total*Decimal('.70'): o.status='deposit_verified'
+        if o.status in ('in_production','quality_check','ready_for_dispatch','dispatched','delivered'): pass
+        elif o.verified_paid>=o.total: o.status='fully_paid'
+        elif o.kind=='bespoke' and o.verified_paid>=deposit_due(o.total): o.status='deposit_verified'
         else: o.status='awaiting_payment'
     session.commit();return order_view(o)
 @app.patch('/admin/orders/{order_id}/status')
@@ -229,7 +248,7 @@ def set_status(order_id:str,data:StatusIn,who:str=Depends(admin_guard),session:S
     if not o: raise HTTPException(404,'Order not found')
     allowed={'in_production','quality_check','ready_for_dispatch','dispatched','delivered'}
     if data.status not in allowed: raise HTTPException(422,'Invalid status')
-    if data.status in {'in_production','quality_check','ready_for_dispatch','dispatched','delivered'} and o.kind=='bespoke' and o.verified_paid<o.total*Decimal('.70'):
+    if data.status in {'in_production','quality_check','ready_for_dispatch','dispatched','delivered'} and o.kind=='bespoke' and o.verified_paid<deposit_due(o.total):
         raise HTTPException(409,'Verified 70% deposit required before production')
     if data.status in {'ready_for_dispatch','dispatched','delivered'} and o.verified_paid<o.total:
         raise HTTPException(409,'Full verified payment required before dispatch')
@@ -369,6 +388,32 @@ def report_data(session:Session):
 def admin_report(who:str=Depends(admin_guard),session:Session=Depends(db)):
     return report_data(session)
 
+
+@app.get('/admin/reports/overview')
+def overview(who:str=Depends(admin_guard),session:Session=Depends(db)):
+    data=report_data(session)
+    tz=timezone(timedelta(hours=1))
+    today=datetime.now(tz).date()
+    def local_date(dt):
+        return (dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)).astimezone(tz).date()
+    periods={'today':today,'week':today-timedelta(days=today.weekday()),'month':today.replace(day=1)}
+    receipts={k:Decimal('0') for k in periods}
+    by_kind={}
+    pending=0
+    for amount,status,reviewed,kind in session.execute(select(Payment.amount,Payment.status,Payment.reviewed_at,Order.kind).join(Order,Order.id==Payment.order_id)):
+        if status=='pending_verification': pending+=1
+        if status=='verified':
+            by_kind[kind]=by_kind.get(kind,Decimal('0'))+amount
+            if reviewed:
+                day=local_date(reviewed)
+                for k,start in periods.items():
+                    if start<=day<=today: receipts[k]+=amount
+    sold={}
+    for m in data['movements']:
+        if m['reason']=='verified_sale' and m['change']<0:
+            sold[m['product_id']]=sold.get(m['product_id'],0)-m['change']
+    return {**data,'period_receipts':{k:str(v) for k,v in receipts.items()},'receipts_by_kind':{k:str(v) for k,v in by_kind.items()},'pending_receipts':pending,'sold_by_product':sold,'as_of':datetime.now(tz).isoformat()}
+
 @app.get('/admin/reports/export/{kind}')
 def admin_export(kind:str,who:str=Depends(admin_guard),session:Session=Depends(db)):
     data=report_data(session)
@@ -379,3 +424,57 @@ def admin_export(kind:str,who:str=Depends(admin_guard),session:Session=Depends(d
     buf=io.StringIO();writer=csv.DictWriter(buf,fieldnames=columns[kind]);writer.writeheader();writer.writerows(data[kind])
     return Response(content='\ufeff'+buf.getvalue(),media_type='text/csv; charset=utf-8',headers={
       'Content-Disposition':f'attachment; filename="vivakriss_{kind}.csv"','Cache-Control':'no-store'})
+
+
+class BespokeQuote(BaseModel):
+    total:Decimal=Field(gt=0,max_digits=12,decimal_places=2)
+
+@app.post('/bespoke-requests',status_code=201)
+async def submit_bespoke(customer_name:str=Form(...,min_length=2,max_length=120),phone:str=Form(...,min_length=7,max_length=30),email:str=Form(...,min_length=5,max_length=200),address:str=Form(...,min_length=5,max_length=500),description:str=Form(...,min_length=3,max_length=2000),file:Optional[UploadFile]=File(None),session:Session=Depends(db)):
+    raw=None; mime=None
+    if file:
+        raw=await file.read(5*1024*1024+1); mime=file.content_type
+        if not raw or len(raw)>5*1024*1024: raise HTTPException(413,'Photo must be up to 5 MB')
+        if not ((mime=='image/jpeg' and raw.startswith(b'\xff\xd8\xff')) or (mime=='image/png' and raw.startswith(b'\x89PNG\r\n\x1a\n')) or (mime=='image/webp' and raw.startswith(b'RIFF') and raw[8:12]==b'WEBP')): raise HTTPException(415,'Invalid image')
+    key=secrets.token_urlsafe(32)
+    r=BespokeRequest(id=str(uuid.uuid4()),access_hash=hashlib.sha256(key.encode()).hexdigest(),customer_name=customer_name,phone=phone,email=email,address=address,description=description,photo=raw,mime=mime)
+    session.add(r);session.commit();return {'id':r.id,'access_key':key}
+
+def bespoke_view(r,session):
+    o=session.get(Order,r.order_id) if r.order_id else None
+    return {'id':r.id,'quote':str(r.quote) if r.quote is not None else None,'deposit':str(deposit_due(r.quote)) if r.quote is not None else None,'order':order_view(o) if o else None,'status':o.status if o else ('quoted' if r.quote else 'new')}
+
+def customer_request(rid,key,session,lock=False):
+    q=select(BespokeRequest).where(BespokeRequest.id==rid)
+    r=session.scalar(q.with_for_update() if lock else q)
+    if not r or not secrets.compare_digest(r.access_hash,hashlib.sha256(key.encode()).hexdigest()): raise HTTPException(404,'Request not found')
+    return r
+
+@app.get('/bespoke-requests/{rid}')
+def get_bespoke(rid:str,authorization:str=Header(''),session:Session=Depends(db)):
+    return bespoke_view(customer_request(rid,authorization.removeprefix('Bearer '),session),session)
+
+@app.post('/bespoke-requests/{rid}/accept')
+def accept_bespoke(rid:str,data:BespokeQuote,authorization:str=Header(''),session:Session=Depends(db)):
+    r=customer_request(rid,authorization.removeprefix('Bearer '),session,True)
+    if r.order_id: return bespoke_view(r,session)
+    if r.quote is None or r.quote!=data.total: raise HTTPException(409,'Quotation changed; refresh before accepting')
+    o=Order(id=str(uuid.uuid4()),customer_name=r.customer_name,phone=r.phone,email=r.email,address=r.address,description=r.description,kind='bespoke',total=r.quote,verified_paid=Decimal('0'),status='awaiting_payment')
+    session.add(o);session.flush();r.order_id=o.id;session.commit();return bespoke_view(r,session)
+
+@app.get('/admin/bespoke-requests')
+def admin_bespoke(who:str=Depends(admin_guard),session:Session=Depends(db)):
+    return [{**bespoke_view(r,session),'customer_name':r.customer_name,'phone':r.phone,'email':r.email,'address':r.address,'description':r.description,'has_photo':r.mime is not None} for r in session.scalars(select(BespokeRequest)).all()]
+
+@app.post('/admin/bespoke-requests/{rid}/quote')
+def quote_bespoke(rid:str,data:BespokeQuote,who:str=Depends(admin_guard),session:Session=Depends(db)):
+    r=session.scalar(select(BespokeRequest).where(BespokeRequest.id==rid).with_for_update())
+    if not r: raise HTTPException(404,'Request not found')
+    if r.order_id: raise HTTPException(409,'Accepted quotation cannot be changed')
+    r.quote=data.total;session.commit();return bespoke_view(r,session)
+
+@app.get('/admin/bespoke-requests/{rid}/photo')
+def bespoke_photo(rid:str,who:str=Depends(admin_guard),session:Session=Depends(db)):
+    r=session.get(BespokeRequest,rid)
+    if not r or not r.photo: raise HTTPException(404,'Photo not found')
+    return Response(r.photo,media_type=r.mime,headers={'Cache-Control':'no-store','X-Content-Type-Options':'nosniff','Content-Disposition':'attachment; filename="inspiration"'})
